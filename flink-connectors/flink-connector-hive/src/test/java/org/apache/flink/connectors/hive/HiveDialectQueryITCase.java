@@ -18,6 +18,7 @@
 
 package org.apache.flink.connectors.hive;
 
+import org.apache.flink.configuration.BatchExecutionOptions;
 import org.apache.flink.table.HiveVersionTestUtil;
 import org.apache.flink.table.api.SqlDialect;
 import org.apache.flink.table.api.TableEnvironment;
@@ -43,7 +44,9 @@ import org.apache.hadoop.hive.ql.udf.generic.GenericUDTF;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.JavaConstantLongObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorUtils;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.junit.BeforeClass;
@@ -58,6 +61,7 @@ import java.io.FileReader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -89,6 +93,7 @@ public class HiveDialectQueryITCase {
         hiveCatalog.getHiveConf().setVar(HiveConf.ConfVars.HIVE_QUOTEDID_SUPPORT, "none");
         hiveCatalog.open();
         tableEnv = getTableEnvWithHiveCatalog();
+        tableEnv.getConfig().set(BatchExecutionOptions.ADAPTIVE_AUTO_PARALLELISM_ENABLED, false);
         warehouse = hiveCatalog.getHiveConf().getVar(HiveConf.ConfVars.METASTOREWAREHOUSE);
 
         // create tables
@@ -853,6 +858,33 @@ public class HiveDialectQueryITCase {
     }
 
     @Test
+    public void testLiteral() throws Exception {
+        List<Row> result =
+                CollectionUtil.iteratorToList(
+                        tableEnv.executeSql("SELECT asin(2), binary('1'), struct(2, 9, 7)")
+                                .collect());
+        if (HiveVersionTestUtil.HIVE_310_OR_LATER) {
+            assertThat(result.toString()).isEqualTo("[+I[null, [49], +I[2, 9, 7]]]");
+        } else {
+            assertThat(result.toString()).isEqualTo("[+I[NaN, [49], +I[2, 9, 7]]]");
+        }
+        tableEnv.executeSql("create table test_decimal_literal(d decimal(10, 2))");
+        try {
+            tableEnv.executeSql("insert into test_decimal_literal values (1.2)").await();
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql(
+                                            "select d / 3, d / 3L, 6 / d, 6L / d from test_decimal_literal")
+                                    .collect());
+            assertThat(result.toString())
+                    .isEqualTo("[+I[0.400000, 0.400000, 5.00000000000, 5.00000000000]]");
+
+        } finally {
+            tableEnv.executeSql("drop table test_decimal_literal");
+        }
+    }
+
+    @Test
     public void testCrossCatalogQueryNoHiveTable() throws Exception {
         // register a new in-memory catalog
         Catalog inMemoryCatalog = new GenericInMemoryCatalog("m_catalog", "db");
@@ -908,6 +940,51 @@ public class HiveDialectQueryITCase {
             tableEnv.executeSql("drop table m_catalog.db.t2");
             tableEnv.executeSql("drop table t1");
             tableEnv.getConfig().setSqlDialect(SqlDialect.HIVE);
+        }
+    }
+
+    @Test
+    public void testNullLiteralAsArgument() throws Exception {
+        tableEnv.executeSql("create table test_ts(ts timestamp)");
+        tableEnv.executeSql("create table t_bigint(ts bigint)");
+        tableEnv.executeSql("create table t_array(a_t array<bigint>)");
+        Long testTimestamp = 1671058803926L;
+        // timestamp's behavior is different between hive2 and hive3, so
+        // use HiveShim in this test to hide such difference
+        HiveShim hiveShim = HiveShimLoader.loadHiveShim(HiveShimLoader.getHiveVersion());
+        LocalDateTime expectDateTime =
+                hiveShim.toFlinkTimestamp(
+                        PrimitiveObjectInspectorUtils.getTimestamp(
+                                testTimestamp, new JavaConstantLongObjectInspector(testTimestamp)));
+        try {
+            tableEnv.executeSql(
+                            String.format(
+                                    "insert into table t_bigint values (%s), (null)",
+                                    testTimestamp))
+                    .await();
+            // the return data type for expression if(ts = 0, null ,ts) should be bigint instead of
+            // string. otherwise, the all values in table t_bigint wll be null since
+            // cast("1671058803926" as timestamp) will return null
+            tableEnv.executeSql(
+                            "insert into table test_ts select if(ts = 0, null ,ts) from t_bigint")
+                    .await();
+            List<Row> result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from test_ts").collect());
+            // verify it can cast to timestamp value correctly
+            assertThat(result.toString())
+                    .isEqualTo(String.format("[+I[%s], +I[null]]", expectDateTime));
+
+            // test cast null as bigint
+            tableEnv.executeSql("insert into t_array select array(cast(null as bigint))").await();
+            result =
+                    CollectionUtil.iteratorToList(
+                            tableEnv.executeSql("select * from t_array").collect());
+            assertThat(result.toString()).isEqualTo("[+I[null]]");
+        } finally {
+            tableEnv.executeSql("drop table test_ts");
+            tableEnv.executeSql("drop table t_bigint");
+            tableEnv.executeSql("drop table t_array");
         }
     }
 
